@@ -26,7 +26,9 @@ from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-DOCS_PATH     = Path(os.environ.get("DOCS_PATH", Path.home() / "docs")).resolve()
+_docs_env = os.environ.get("DOCS_PATH", str(Path.home() / "docs"))
+DOCS_PATHS = [Path(p.strip()).resolve() for p in _docs_env.split(",") if p.strip()]
+DOCS_PATH  = DOCS_PATHS[0]  # kept for backwards compat with _index_file rel_path
 OLLAMA_URL    = os.environ.get("OLLAMA_URL", "http://anteframe:11434")
 EMBED_MODEL   = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 DB_PATH       = Path(os.environ.get("DB_PATH", Path.home() / ".local/share/docs-rag/chroma"))
@@ -70,7 +72,7 @@ def _doc_id(filepath: str, chunk_idx: int) -> str:
     return hashlib.md5(f"{filepath}:{chunk_idx}".encode()).hexdigest()
 
 
-def _index_file(path: Path) -> int:
+def _index_file(path: Path, base: Path = None) -> int:
     """Index a single markdown file. Returns number of chunks added."""
     try:
         text = path.read_text(encoding="utf-8").strip()
@@ -80,7 +82,7 @@ def _index_file(path: Path) -> int:
     if not text:
         return 0
 
-    rel_path = str(path.relative_to(DOCS_PATH))
+    rel_path = str(path.relative_to(base or DOCS_PATH))
     chunks = _chunk_text(text)
 
     # Remove existing chunks for this file
@@ -106,18 +108,23 @@ def _ensure_indexed() -> None:
 
 
 def _run_reindex() -> dict:
-    md_files = list(DOCS_PATH.rglob("*.md"))
+    md_files = []
+    for dp in DOCS_PATHS:
+        if dp.exists():
+            md_files.extend(dp.rglob("*.md"))
     total_chunks = 0
     indexed_files = []
     skipped = []
 
     for f in md_files:
-        n = _index_file(f)
+        # find which base path this file belongs to for rel_path display
+        base = next((dp for dp in DOCS_PATHS if str(f).startswith(str(dp))), DOCS_PATH)
+        n = _index_file(f, base)
         if n > 0:
-            indexed_files.append(str(f.relative_to(DOCS_PATH)))
+            indexed_files.append(str(f.relative_to(base)))
             total_chunks += n
         else:
-            skipped.append(str(f.relative_to(DOCS_PATH)))
+            skipped.append(str(f.relative_to(base)))
 
     return {
         "files_indexed": len(indexed_files),
@@ -187,7 +194,7 @@ def reindex_docs() -> str:
     result = _run_reindex()
     lines = [
         f"Indexed {result['files_indexed']} files ({result['total_chunks']} chunks)",
-        f"Docs path: {DOCS_PATH}",
+        f"Docs paths: {', '.join(str(p) for p in DOCS_PATHS)}",
     ]
     if result["files"]:
         lines.append("\nFiles indexed:")
