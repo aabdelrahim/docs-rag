@@ -17,19 +17,23 @@ DOCS_PATHS = [Path(p.strip()).resolve() for p in _docs_env.split(",") if p.strip
 DOCS_PATH  = DOCS_PATHS[0]
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://anteframe:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
-DB_PATH    = Path(os.environ.get("DB_PATH", Path.home() / ".local/share/docs-rag/chroma"))
+DB_PATH     = Path(os.environ.get("DB_PATH", Path.home() / ".local/share/docs-rag/chroma"))
+CHROMA_HOST = os.environ.get("CHROMA_HOST", "")  # host:port — use remote HttpClient when set
 COLLECTION = "docs"
 CHUNK_SIZE    = 800
 CHUNK_OVERLAP = 100
-
-DB_PATH.mkdir(parents=True, exist_ok=True)
 
 embed_fn = OllamaEmbeddingFunction(
     url=f"{OLLAMA_URL}/api/embeddings",
     model_name=EMBED_MODEL,
 )
 
-client = chromadb.PersistentClient(path=str(DB_PATH))
+if CHROMA_HOST:
+    _host, _port = (CHROMA_HOST.split(":", 1) + ["8000"])[:2]
+    client = chromadb.HttpClient(host=_host, port=int(_port))
+else:
+    DB_PATH.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(DB_PATH))
 collection = client.get_or_create_collection(
     name=COLLECTION,
     embedding_function=embed_fn,
@@ -76,9 +80,12 @@ def _index_file(path: Path, base: Path = None) -> int:
 
 
 def main():
-    print(f"Docs paths: {', '.join(str(p) for p in DOCS_PATHS)}")
-    print(f"Ollama URL: {OLLAMA_URL}")
-    print(f"DB path:    {DB_PATH}")
+    print(f"Docs paths:  {', '.join(str(p) for p in DOCS_PATHS)}")
+    print(f"Ollama URL:  {OLLAMA_URL}")
+    if CHROMA_HOST:
+        print(f"Chroma:      http://{CHROMA_HOST} (remote)")
+    else:
+        print(f"Chroma DB:   {DB_PATH} (local)")
     print()
 
     md_files = []
