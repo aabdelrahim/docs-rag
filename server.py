@@ -32,11 +32,10 @@ DOCS_PATH  = DOCS_PATHS[0]  # kept for backwards compat with _index_file rel_pat
 OLLAMA_URL    = os.environ.get("OLLAMA_URL", "http://anteframe:11434")
 EMBED_MODEL   = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 DB_PATH       = Path(os.environ.get("DB_PATH", Path.home() / ".local/share/docs-rag/chroma"))
+CHROMA_HOST   = os.environ.get("CHROMA_HOST", "")  # host:port — use remote HttpClient when set
 COLLECTION    = "docs"
 CHUNK_SIZE    = 800   # characters
 CHUNK_OVERLAP = 100
-
-DB_PATH.mkdir(parents=True, exist_ok=True)
 
 PORT = int(os.environ.get("MCP_PORT", "8766"))
 mcp = FastMCP("docs-rag", host="0.0.0.0", port=PORT)
@@ -48,7 +47,12 @@ embed_fn = OllamaEmbeddingFunction(
     model_name=EMBED_MODEL,
 )
 
-client = chromadb.PersistentClient(path=str(DB_PATH))
+if CHROMA_HOST:
+    _host, _port = (CHROMA_HOST.split(":", 1) + ["8000"])[:2]
+    client = chromadb.HttpClient(host=_host, port=int(_port))
+else:
+    DB_PATH.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(DB_PATH))
 collection = client.get_or_create_collection(
     name=COLLECTION,
     embedding_function=embed_fn,
