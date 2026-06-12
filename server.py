@@ -9,10 +9,10 @@ notes so they can be queried in natural language during development.
 
 Tools provided:
   - search_docs    Semantic search across all indexed docs
-  - list_docs      List all indexed documents
+  - list_docs      List all documents currently indexed
   - reindex_docs   Re-index all docs (run after adding/editing files)
 
-Embeddings: nomic-embed-text via Ollama (OLLAMA_URL env var)
+Embeddings: nomic-embed-text via Ollama /api/embed (batch endpoint)
 Storage:    ~/.local/share/docs-rag/chroma/
 Docs path:  DOCS_PATH env var (default: ~/docs/)
 """
@@ -20,32 +20,61 @@ Docs path:  DOCS_PATH env var (default: ~/docs/)
 import os
 import hashlib
 from pathlib import Path
+from typing import List
+
+import httpx
 from mcp.server.fastmcp import FastMCP
 import chromadb
-from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
+from chromadb import EmbeddingFunction, Documents, Embeddings
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 _docs_env = os.environ.get("DOCS_PATH", str(Path.home() / "docs"))
 DOCS_PATHS = [Path(p.strip()).resolve() for p in _docs_env.split(",") if p.strip()]
 DOCS_PATH  = DOCS_PATHS[0]  # kept for backwards compat with _index_file rel_path
-OLLAMA_URL    = os.environ.get("OLLAMA_URL", "http://anteframe:11434")
-EMBED_MODEL   = os.environ.get("EMBED_MODEL", "nomic-embed-text")
-DB_PATH       = Path(os.environ.get("DB_PATH", Path.home() / ".local/share/docs-rag/chroma"))
-CHROMA_HOST   = os.environ.get("CHROMA_HOST", "")  # host:port — use remote HttpClient when set
-COLLECTION    = "docs"
-CHUNK_SIZE    = 800   # characters
+OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://anteframe:11434")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+DB_PATH     = Path(os.environ.get("DB_PATH", Path.home() / ".local/share/docs-rag/chroma"))
+CHROMA_HOST = os.environ.get("CHROMA_HOST", "")  # host:port — use remote HttpClient when set
+COLLECTION  = "docs"
+CHUNK_SIZE    = 800
 CHUNK_OVERLAP = 100
+EMBED_BATCH   = int(os.environ.get("EMBED_BATCH", "32"))
 
 PORT = int(os.environ.get("MCP_PORT", "8766"))
 mcp = FastMCP("docs-rag", host="0.0.0.0", port=PORT)
 
-# ─── ChromaDB setup ───────────────────────────────────────────────────────────
+# ─── Batch embedder ───────────────────────────────────────────────────────────
 
-embed_fn = OllamaEmbeddingFunction(
-    url=f"{OLLAMA_URL}/api/embeddings",
-    model_name=EMBED_MODEL,
-)
+class BatchOllamaEmbedder(EmbeddingFunction[Documents]):
+    """Embedding function using Ollama /api/embed (batch endpoint, ~5-10× faster than serial)."""
+
+    def __init__(self, base_url: str, model: str, batch_size: int = EMBED_BATCH):
+        self._base = base_url.rstrip("/")
+        self._model = model
+        self._batch_size = batch_size
+
+    @staticmethod
+    def name() -> str:
+        return "ollama"  # matches persisted collection metadata from OllamaEmbeddingFunction
+
+    def __call__(self, input: Documents) -> Embeddings:
+        embeddings: List[List[float]] = []
+        for i in range(0, len(input), self._batch_size):
+            batch = input[i : i + self._batch_size]
+            resp = httpx.post(
+                f"{self._base}/api/embed",
+                json={"model": self._model, "input": batch},
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+            embeddings.extend(resp.json()["embeddings"])
+        return embeddings
+
+
+embed_fn = BatchOllamaEmbedder(base_url=OLLAMA_URL, model=EMBED_MODEL)
+
+# ─── ChromaDB setup ───────────────────────────────────────────────────────────
 
 if CHROMA_HOST:
     _host, _port = (CHROMA_HOST.split(":", 1) + ["8000"])[:2]
@@ -53,16 +82,29 @@ if CHROMA_HOST:
 else:
     DB_PATH.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(DB_PATH))
-collection = client.get_or_create_collection(
-    name=COLLECTION,
-    embedding_function=embed_fn,
-    metadata={"hnsw:space": "cosine"},
-)
+
+_collection_cache = None
+
+
+def _get_collection():
+    """Return a valid collection handle, refreshing if the cached one is stale."""
+    global _collection_cache
+    if _collection_cache is not None:
+        try:
+            _collection_cache.count()
+            return _collection_cache
+        except Exception:
+            _collection_cache = None
+    _collection_cache = client.get_or_create_collection(
+        name=COLLECTION,
+        embedding_function=embed_fn,
+        metadata={"hnsw:space": "cosine"},
+    )
+    return _collection_cache
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Split text into overlapping chunks."""
     chunks = []
     start = 0
     while start < len(text):
@@ -86,14 +128,14 @@ def _index_file(path: Path, base: Path = None) -> int:
     if not text:
         return 0
 
+    col = _get_collection()
     rel_path = str(path.relative_to(base or DOCS_PATH))
     chunks = _chunk_text(text)
 
-    # Remove existing chunks for this file
     try:
-        existing = collection.get(where={"source": rel_path})
+        existing = col.get(where={"source": rel_path})
         if existing["ids"]:
-            collection.delete(ids=existing["ids"])
+            col.delete(ids=existing["ids"])
     except Exception:
         pass
 
@@ -101,13 +143,12 @@ def _index_file(path: Path, base: Path = None) -> int:
     documents = chunks
     metadatas = [{"source": rel_path, "chunk": i, "total_chunks": len(chunks)} for i in range(len(chunks))]
 
-    collection.add(ids=ids, documents=documents, metadatas=metadatas)
+    col.add(ids=ids, documents=documents, metadatas=metadatas)
     return len(chunks)
 
 
 def _ensure_indexed() -> None:
-    """Index all docs if the collection is empty."""
-    if collection.count() == 0:
+    if _get_collection().count() == 0:
         _run_reindex()
 
 
@@ -121,7 +162,6 @@ def _run_reindex() -> dict:
     skipped = []
 
     for f in md_files:
-        # find which base path this file belongs to for rel_path display
         base = next((dp for dp in DOCS_PATHS if str(f).startswith(str(dp))), DOCS_PATH)
         n = _index_file(f, base)
         if n > 0:
@@ -150,10 +190,11 @@ def search_docs(query: str, n_results: int = 5) -> str:
         n_results: Number of results to return (default 5)
     """
     _ensure_indexed()
+    col = _get_collection()
 
-    results = collection.query(
+    results = col.query(
         query_texts=[query],
-        n_results=min(n_results, collection.count()),
+        n_results=min(n_results, col.count()),
         include=["documents", "metadatas", "distances"],
     )
 
@@ -179,8 +220,9 @@ def search_docs(query: str, n_results: int = 5) -> str:
 def list_docs() -> str:
     """List all documents currently indexed in the RAG store."""
     _ensure_indexed()
+    col = _get_collection()
 
-    results = collection.get(include=["metadatas"])
+    results = col.get(include=["metadatas"])
     if not results["metadatas"]:
         return "No documents indexed yet. Run reindex_docs first."
 
