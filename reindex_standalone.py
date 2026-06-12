@@ -9,24 +9,52 @@ Usage:
 import os
 import hashlib
 from pathlib import Path
+from typing import List
+
+import httpx
 import chromadb
-from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
+from chromadb import EmbeddingFunction, Documents, Embeddings
 
 _docs_env  = os.environ.get("DOCS_PATH", str(Path.home() / "docs"))
 DOCS_PATHS = [Path(p.strip()).resolve() for p in _docs_env.split(",") if p.strip()]
 DOCS_PATH  = DOCS_PATHS[0]
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://anteframe:11434")
+OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://anteframe:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 DB_PATH     = Path(os.environ.get("DB_PATH", Path.home() / ".local/share/docs-rag/chroma"))
 CHROMA_HOST = os.environ.get("CHROMA_HOST", "")  # host:port — use remote HttpClient when set
-COLLECTION = "docs"
+COLLECTION  = "docs"
 CHUNK_SIZE    = 800
 CHUNK_OVERLAP = 100
+EMBED_BATCH   = int(os.environ.get("EMBED_BATCH", "32"))
 
-embed_fn = OllamaEmbeddingFunction(
-    url=f"{OLLAMA_URL}/api/embeddings",
-    model_name=EMBED_MODEL,
-)
+
+class BatchOllamaEmbedder(EmbeddingFunction[Documents]):
+    """Embedding function using Ollama /api/embed (batch endpoint, ~5-10× faster than serial)."""
+
+    def __init__(self, base_url: str, model: str, batch_size: int = EMBED_BATCH):
+        self._base = base_url.rstrip("/")
+        self._model = model
+        self._batch_size = batch_size
+
+    @staticmethod
+    def name() -> str:
+        return "ollama"  # matches persisted collection metadata from OllamaEmbeddingFunction
+
+    def __call__(self, input: Documents) -> Embeddings:
+        embeddings: List[List[float]] = []
+        for i in range(0, len(input), self._batch_size):
+            batch = input[i : i + self._batch_size]
+            resp = httpx.post(
+                f"{self._base}/api/embed",
+                json={"model": self._model, "input": batch},
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+            embeddings.extend(resp.json()["embeddings"])
+        return embeddings
+
+
+embed_fn = BatchOllamaEmbedder(base_url=OLLAMA_URL, model=EMBED_MODEL)
 
 if CHROMA_HOST:
     _host, _port = (CHROMA_HOST.split(":", 1) + ["8000"])[:2]
@@ -34,6 +62,7 @@ if CHROMA_HOST:
 else:
     DB_PATH.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(DB_PATH))
+
 collection = client.get_or_create_collection(
     name=COLLECTION,
     embedding_function=embed_fn,
@@ -82,6 +111,7 @@ def _index_file(path: Path, base: Path = None) -> int:
 def main():
     print(f"Docs paths:  {', '.join(str(p) for p in DOCS_PATHS)}")
     print(f"Ollama URL:  {OLLAMA_URL}")
+    print(f"Embed model: {EMBED_MODEL}  (batch_size={EMBED_BATCH})")
     if CHROMA_HOST:
         print(f"Chroma:      http://{CHROMA_HOST} (remote)")
     else:
