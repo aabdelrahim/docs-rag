@@ -26,6 +26,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 import chromadb
 from chromadb import EmbeddingFunction, Documents, Embeddings
+from asyncify import aio
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -180,6 +181,7 @@ def _run_reindex() -> dict:
 # ─── MCP Tools ────────────────────────────────────────────────────────────────
 
 @mcp.tool()
+@aio
 def search_docs(query: str, n_results: int = 5) -> str:
     """
     Semantic search across all indexed docs.
@@ -217,6 +219,7 @@ def search_docs(query: str, n_results: int = 5) -> str:
 
 
 @mcp.tool()
+@aio
 def list_docs() -> str:
     """List all documents currently indexed in the RAG store."""
     _ensure_indexed()
@@ -232,6 +235,7 @@ def list_docs() -> str:
 
 
 @mcp.tool()
+@aio
 def reindex_docs() -> str:
     """
     Re-index all markdown files from the docs directory.
