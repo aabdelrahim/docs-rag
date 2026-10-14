@@ -7,7 +7,8 @@ HOST="${DOCS_RAG_HOST:-services}"
 DIR=/opt/docs-rag
 cd "$(dirname "$0")"
 
-/private/tmp/dragvenv/bin/python test_prune.py >/dev/null 2>&1 || python3 test_prune.py
+PY="${DOCS_RAG_PY:-python3}"  # any python with requirements.txt installed
+"$PY" test_prune.py
 
 echo "→ copy server.py asyncify.py requirements.txt → $HOST:$DIR"
 for f in server.py asyncify.py requirements.txt; do
