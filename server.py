@@ -171,12 +171,32 @@ def _run_reindex() -> dict:
         else:
             skipped.append(str(f.relative_to(base)))
 
+    pruned = _prune_stale(set(indexed_files) | set(skipped))
     return {
         "files_indexed": len(indexed_files),
         "total_chunks": total_chunks,
         "skipped": skipped,
         "files": indexed_files,
+        "pruned_sources": pruned,
     }
+
+
+# A reindex only (re)adds files it finds, so chunks of a DELETED doc stayed searchable forever (infra-config #1118:
+# 137 removed docs still answered queries on CT101). Prune sources with no file behind them. A shared remote store
+# (CHROMA_HOST) can hold other indexers' sources, so there it only runs when PRUNE_STALE=1 says so.
+PRUNE_STALE = os.environ.get("PRUNE_STALE", "0" if CHROMA_HOST else "1") == "1"
+
+
+def _prune_stale(current: set) -> list:
+    if not PRUNE_STALE:
+        return []
+    col = _get_collection()
+    got = col.get(include=["metadatas"])
+    stale = sorted({m.get("source") for m in got["metadatas"] if m and m.get("source") not in current})
+    ids = [i for i, m in zip(got["ids"], got["metadatas"]) if m and m.get("source") in set(stale)]
+    for k in range(0, len(ids), 500):
+        col.delete(ids=ids[k:k + 500])
+    return stale
 
 # ─── MCP Tools ────────────────────────────────────────────────────────────────
 
@@ -245,6 +265,7 @@ def reindex_docs() -> str:
     lines = [
         f"Indexed {result['files_indexed']} files ({result['total_chunks']} chunks)",
         f"Docs paths: {', '.join(str(p) for p in DOCS_PATHS)}",
+        f"Pruned {len(result['pruned_sources'])} stale sources (file gone)",
     ]
     if result["files"]:
         lines.append("\nFiles indexed:")
