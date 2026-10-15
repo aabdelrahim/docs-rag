@@ -18,6 +18,7 @@ Docs path:  DOCS_PATH env var (default: ~/docs/)
 """
 
 import os
+import sys
 import hashlib
 from pathlib import Path
 from typing import List
@@ -171,13 +172,14 @@ def _run_reindex() -> dict:
         else:
             skipped.append(str(f.relative_to(base)))
 
-    pruned = _prune_stale(set(indexed_files) | set(skipped))
+    pruned, refused = _prune_stale(set(indexed_files) | set(skipped))
     return {
         "files_indexed": len(indexed_files),
         "total_chunks": total_chunks,
         "skipped": skipped,
         "files": indexed_files,
         "pruned_sources": pruned,
+        "prune_refused": refused,
     }
 
 
@@ -185,18 +187,35 @@ def _run_reindex() -> dict:
 # 137 removed docs still answered queries on CT101). Prune sources with no file behind them. A shared remote store
 # (CHROMA_HOST) can hold other indexers' sources, so there it only runs when PRUNE_STALE=1 says so.
 PRUNE_STALE = os.environ.get("PRUNE_STALE", "0" if CHROMA_HOST else "1") == "1"
+# Floor: a missing/unmounted DOCS_PATH or a half-copied corpus looks exactly like "every doc was deleted". Refuse to
+# prune when nothing was found, or when more than this share of indexed sources would go -- a real cleanup that big
+# is rare enough to do by hand (PRUNE_MAX_FRACTION=1 + restart, for one reindex).
+PRUNE_MAX_FRACTION = float(os.environ.get("PRUNE_MAX_FRACTION", "0.2"))
 
 
-def _prune_stale(current: set) -> list:
+def _prune_stale(current: set) -> tuple:
+    """Delete chunks whose source file is gone. Returns (pruned_sources, refusal_reason or "")."""
     if not PRUNE_STALE:
-        return []
+        return [], ""
+    if not current:
+        return _refuse("current file set is empty (DOCS_PATH missing/unmounted?)")
     col = _get_collection()
     got = col.get(include=["metadatas"])
-    stale = sorted({m.get("source") for m in got["metadatas"] if m and m.get("source") not in current})
+    sources = {m.get("source") for m in got["metadatas"] if m}
+    stale = sorted(s for s in sources if s not in current)
+    if sources and len(stale) > PRUNE_MAX_FRACTION * len(sources):
+        return _refuse(f"{len(stale)}/{len(sources)} sources would go (> {PRUNE_MAX_FRACTION:.0%} floor)")
     ids = [i for i, m in zip(got["ids"], got["metadatas"]) if m and m.get("source") in set(stale)]
     for k in range(0, len(ids), 500):
         col.delete(ids=ids[k:k + 500])
-    return stale
+    return stale, ""
+
+
+def _refuse(reason: str) -> tuple:
+    # returned, not kept in a global: reindexes run in worker threads and could overwrite each other's reason.
+    # reindex_docs prints it so sync-docs-rag.sh can alert (stderr only reaches CT101's journal).
+    print(f"prune refused: {reason}", file=sys.stderr)
+    return [], reason
 
 # ─── MCP Tools ────────────────────────────────────────────────────────────────
 
@@ -267,6 +286,8 @@ def reindex_docs() -> str:
         f"Docs paths: {', '.join(str(p) for p in DOCS_PATHS)}",
         f"Pruned {len(result['pruned_sources'])} stale sources (file gone)",
     ]
+    if result["prune_refused"]:
+        lines.append(f"Prune refused: {result['prune_refused']}")
     if result["files"]:
         lines.append("\nFiles indexed:")
         lines.extend(f"  {f}" for f in result["files"])
