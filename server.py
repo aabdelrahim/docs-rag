@@ -172,14 +172,14 @@ def _run_reindex() -> dict:
         else:
             skipped.append(str(f.relative_to(base)))
 
-    pruned = _prune_stale(set(indexed_files) | set(skipped))
+    pruned, refused = _prune_stale(set(indexed_files) | set(skipped))
     return {
         "files_indexed": len(indexed_files),
         "total_chunks": total_chunks,
         "skipped": skipped,
         "files": indexed_files,
         "pruned_sources": pruned,
-        "prune_refused": PRUNE_REFUSED,
+        "prune_refused": refused,
     }
 
 
@@ -189,23 +189,14 @@ def _run_reindex() -> dict:
 PRUNE_STALE = os.environ.get("PRUNE_STALE", "0" if CHROMA_HOST else "1") == "1"
 # Floor: a missing/unmounted DOCS_PATH or a half-copied corpus looks exactly like "every doc was deleted". Refuse to
 # prune when nothing was found, or when more than this share of indexed sources would go -- a real cleanup that big
-# is rare enough to do by hand (PRUNE_MAX_FRACTION=1 for one run).
+# is rare enough to do by hand (PRUNE_MAX_FRACTION=1 + restart, for one reindex).
 PRUNE_MAX_FRACTION = float(os.environ.get("PRUNE_MAX_FRACTION", "0.2"))
-PRUNE_REFUSED = ""  # last refusal reason; reindex_docs reports it so sync-docs-rag.sh can alert (stderr is CT101-only)
 
 
-def _refuse(reason: str) -> list:
-    global PRUNE_REFUSED
-    PRUNE_REFUSED = reason
-    print(f"prune refused: {reason}", file=sys.stderr)
-    return []
-
-
-def _prune_stale(current: set) -> list:
-    global PRUNE_REFUSED
-    PRUNE_REFUSED = ""
+def _prune_stale(current: set) -> tuple:
+    """Delete chunks whose source file is gone. Returns (pruned_sources, refusal_reason or "")."""
     if not PRUNE_STALE:
-        return []
+        return [], ""
     if not current:
         return _refuse("current file set is empty (DOCS_PATH missing/unmounted?)")
     col = _get_collection()
@@ -217,7 +208,14 @@ def _prune_stale(current: set) -> list:
     ids = [i for i, m in zip(got["ids"], got["metadatas"]) if m and m.get("source") in set(stale)]
     for k in range(0, len(ids), 500):
         col.delete(ids=ids[k:k + 500])
-    return stale
+    return stale, ""
+
+
+def _refuse(reason: str) -> tuple:
+    # returned, not kept in a global: reindexes run in worker threads and could overwrite each other's reason.
+    # reindex_docs prints it so sync-docs-rag.sh can alert (stderr only reaches CT101's journal).
+    print(f"prune refused: {reason}", file=sys.stderr)
+    return [], reason
 
 # ─── MCP Tools ────────────────────────────────────────────────────────────────
 
