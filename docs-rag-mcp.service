@@ -1,5 +1,5 @@
 [Unit]
-Description=docs-rag-mcp SSE server
+Description=docs-rag-mcp server (streamable-http)
 After=network.target
 
 [Service]

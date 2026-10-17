@@ -20,7 +20,7 @@ echo "→ install unit docs-rag-mcp.service (declared here since 2026-10-17; was
 ssh "$HOST" "cat > /etc/systemd/system/docs-rag-mcp.service.new" < docs-rag-mcp.service
 # The RFC-060 drop-in (MCP_TRANSPORT=streamable-http) is folded into the unit above; remove it so
 # the repo is the whole effective config.
-ssh "$HOST" "mv /etc/systemd/system/docs-rag-mcp.service.new /etc/systemd/system/docs-rag-mcp.service && rm -f /etc/systemd/system/docs-rag-mcp.service.d/rfc060.conf && rmdir --ignore-fail-on-non-empty /etc/systemd/system/docs-rag-mcp.service.d 2>/dev/null; systemctl daemon-reload"
+ssh "$HOST" "mv /etc/systemd/system/docs-rag-mcp.service.new /etc/systemd/system/docs-rag-mcp.service && rm -f /etc/systemd/system/docs-rag-mcp.service.d/rfc060.conf && { rmdir --ignore-fail-on-non-empty /etc/systemd/system/docs-rag-mcp.service.d 2>/dev/null || true; } && systemctl daemon-reload"
 ssh "$HOST" "systemctl show docs-rag-mcp -p Environment --value | tr ' ' '\\n' | grep -qx MCP_TRANSPORT=streamable-http" \
   || { echo "❌ effective MCP_TRANSPORT is not streamable-http after unit install" >&2; exit 1; }
 
