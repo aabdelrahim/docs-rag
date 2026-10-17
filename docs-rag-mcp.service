@@ -1,0 +1,20 @@
+[Unit]
+Description=docs-rag-mcp server (streamable-http)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/docs-rag
+ExecStart=/opt/docs-rag/.venv/bin/python server.py
+Environment=DOCS_PATH=/opt/docs/infra-config/docs
+# af LAN IP (Ethernet since 2026-10-17, infra-config #1200). CT101 has no tailnet route.
+Environment=OLLAMA_URL=http://192.168.50.238:11434
+Environment=MCP_PORT=4004
+# streamable-http (/mcp) since RFC-060 P4 -- folded in from the former drop-in
+# docs-rag-mcp.service.d/rfc060.conf, which deploy.sh now removes (repo = effective config).
+Environment=MCP_TRANSPORT=streamable-http
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
