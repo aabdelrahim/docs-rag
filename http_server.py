@@ -25,7 +25,7 @@ from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
 _docs_env = os.environ.get("DOCS_PATH", str(Path.home() / "docs"))
 DOCS_PATHS = [Path(p.strip()).resolve() for p in _docs_env.split(",") if p.strip()]
 DOCS_PATH  = DOCS_PATHS[0]
-OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://192.168.50.93:11434")
+OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://192.168.50.238:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 DB_PATH     = Path(os.environ.get("DB_PATH", Path.home() / ".local/share/docs-rag/chroma"))
 CHROMA_HOST = os.environ.get("CHROMA_HOST", "")  # host:port — use remote HttpClient when set

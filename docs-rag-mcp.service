@@ -1,0 +1,18 @@
+[Unit]
+Description=docs-rag-mcp SSE server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/docs-rag
+ExecStart=/opt/docs-rag/.venv/bin/python server.py
+Environment=DOCS_PATH=/opt/docs/infra-config/docs
+# af LAN IP (Ethernet since 2026-10-17, infra-config #1200). CT101 has no tailnet route.
+Environment=OLLAMA_URL=http://192.168.50.238:11434
+Environment=MCP_PORT=4004
+Environment=MCP_TRANSPORT=sse
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
