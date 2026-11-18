@@ -46,7 +46,9 @@ EMBED_BATCH   = int(os.environ.get("EMBED_BATCH", "32"))
 # #6508: one 120 s Ollama read timeout ("timed out in add") used to abort the whole reindex. Longer per-call
 # timeout + retries with backoff; a file that still fails is reported, the rest carry on.
 EMBED_TIMEOUT = float(os.environ.get("EMBED_TIMEOUT", "300"))
-EMBED_RETRIES = int(os.environ.get("EMBED_RETRIES", "3"))
+EMBED_RETRIES = max(1, int(os.environ.get("EMBED_RETRIES", "3")))
+# after this many files in a row fail, Ollama is down: stop burning retries on the rest (next run resumes: unchanged files skip)
+MAX_CONSEC_FAIL = int(os.environ.get("MAX_CONSEC_FAIL", "5"))
 
 PORT = int(os.environ.get("MCP_PORT", "8766"))
 mcp = FastMCP("docs-rag", host="0.0.0.0", port=PORT)
@@ -88,6 +90,8 @@ class BatchOllamaEmbedder(EmbeddingFunction[Documents]):
                 return resp.json()["embeddings"]
             except httpx.HTTPError as e:  # timeouts, connect errors, 5xx (model reload / af busy)
                 last = e
+                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500:
+                    raise  # 4xx (model missing, bad input) will not recover on retry
                 if attempt + 1 < EMBED_RETRIES:
                     time.sleep(_BACKOFF * (2 ** attempt))
         raise last
@@ -162,7 +166,7 @@ def _index_file_ex(path: Path, base: Path = None) -> tuple:
     col = _get_collection()
     rel_path = str(path.relative_to(base or DOCS_PATH))
     chunks = _chunk_text(text)
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(f"{EMBED_MODEL}|{CHUNK_SIZE}|{CHUNK_OVERLAP}\n{text}".encode("utf-8")).hexdigest()
     ids = [_doc_id(rel_path, i) for i in range(len(chunks))]
 
     existing = {"ids": [], "metadatas": []}
@@ -177,7 +181,8 @@ def _index_file_ex(path: Path, base: Path = None) -> tuple:
     metadatas = [{"source": rel_path, "chunk": i, "total_chunks": len(chunks), "hash": digest}
                  for i in range(len(chunks))]
     col.upsert(ids=ids, documents=chunks, metadatas=metadatas)
-    leftover = [i for i in existing["ids"] if i not in set(ids)]
+    idset = set(ids)
+    leftover = [i for i in existing["ids"] if i not in idset]
     for k in range(0, len(leftover), 500):
         col.delete(ids=leftover[k:k + 500])
     return len(chunks), True
@@ -199,6 +204,7 @@ def _run_reindex() -> dict:
     skipped = []
     failed = []
     changed_n = 0
+    consec = 0
 
     for f in md_files:
         base = next((dp for dp in DOCS_PATHS if str(f).startswith(str(dp))), DOCS_PATH)
@@ -208,7 +214,15 @@ def _run_reindex() -> dict:
         except Exception as e:  # one bad file (embed timeout after retries) must not abort the run
             print(f"index failed {rel}: {type(e).__name__}: {e}", file=sys.stderr)
             failed.append(rel)
+            consec += 1
+            if consec >= MAX_CONSEC_FAIL:
+                rest = [str(g.relative_to(next((dp for dp in DOCS_PATHS if str(g).startswith(str(dp))), DOCS_PATH)))
+                        for g in md_files[md_files.index(f) + 1:]]
+                print(f"aborting: {consec} files failed in a row; {len(rest)} not attempted", file=sys.stderr)
+                failed.extend(rest)
+                break
             continue
+        consec = 0
         if n > 0:
             indexed_files.append(rel)
             total_chunks += n
