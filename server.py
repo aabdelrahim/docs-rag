@@ -20,6 +20,7 @@ Docs path:  DOCS_PATH env var (default: ~/docs/)
 import os
 import sys
 import hashlib
+import time
 from pathlib import Path
 from typing import List
 
@@ -42,11 +43,18 @@ COLLECTION  = "docs"
 CHUNK_SIZE    = 800
 CHUNK_OVERLAP = 100
 EMBED_BATCH   = int(os.environ.get("EMBED_BATCH", "32"))
+# #6508: one 120 s Ollama read timeout ("timed out in add") used to abort the whole reindex. Longer per-call
+# timeout + retries with backoff; a file that still fails is reported, the rest carry on.
+EMBED_TIMEOUT = float(os.environ.get("EMBED_TIMEOUT", "300"))
+EMBED_RETRIES = int(os.environ.get("EMBED_RETRIES", "3"))
 
 PORT = int(os.environ.get("MCP_PORT", "8766"))
 mcp = FastMCP("docs-rag", host="0.0.0.0", port=PORT)
 
 # ─── Batch embedder ───────────────────────────────────────────────────────────
+
+_BACKOFF = float(os.environ.get("EMBED_BACKOFF", "5"))
+
 
 class BatchOllamaEmbedder(EmbeddingFunction[Documents]):
     """Embedding function using Ollama /api/embed (batch endpoint, ~5-10× faster than serial)."""
@@ -64,14 +72,25 @@ class BatchOllamaEmbedder(EmbeddingFunction[Documents]):
         embeddings: List[List[float]] = []
         for i in range(0, len(input), self._batch_size):
             batch = input[i : i + self._batch_size]
-            resp = httpx.post(
-                f"{self._base}/api/embed",
-                json={"model": self._model, "input": batch},
-                timeout=120.0,
-            )
-            resp.raise_for_status()
-            embeddings.extend(resp.json()["embeddings"])
+            embeddings.extend(self._embed_batch(batch))
         return embeddings
+
+    def _embed_batch(self, batch):
+        last = None
+        for attempt in range(EMBED_RETRIES):
+            try:
+                resp = httpx.post(
+                    f"{self._base}/api/embed",
+                    json={"model": self._model, "input": batch},
+                    timeout=EMBED_TIMEOUT,
+                )
+                resp.raise_for_status()
+                return resp.json()["embeddings"]
+            except httpx.HTTPError as e:  # timeouts, connect errors, 5xx (model reload / af busy)
+                last = e
+                if attempt + 1 < EMBED_RETRIES:
+                    time.sleep(_BACKOFF * (2 ** attempt))
+        raise last
 
 
 embed_fn = BatchOllamaEmbedder(base_url=OLLAMA_URL, model=EMBED_MODEL)
@@ -121,32 +140,47 @@ def _doc_id(filepath: str, chunk_idx: int) -> str:
 
 
 def _index_file(path: Path, base: Path = None) -> int:
-    """Index a single markdown file. Returns number of chunks added."""
+    """Index a single markdown file. Returns number of chunks (0 = empty/unreadable)."""
+    return _index_file_ex(path, base)[0]
+
+
+def _index_file_ex(path: Path, base: Path = None) -> tuple:
+    """Index one file incrementally. Returns (chunks, changed).
+
+    Unchanged files (same content hash on every stored chunk, same chunk count) are skipped: no embed calls.
+    Changed files are upserted FIRST (deterministic ids), then leftover chunks are deleted, so an embed failure
+    mid-file never leaves the doc missing from the store (#6508; the old order deleted before adding).
+    """
     try:
         text = path.read_text(encoding="utf-8").strip()
     except Exception:
-        return 0
+        return 0, False
 
     if not text:
-        return 0
+        return 0, False
 
     col = _get_collection()
     rel_path = str(path.relative_to(base or DOCS_PATH))
     chunks = _chunk_text(text)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    ids = [_doc_id(rel_path, i) for i in range(len(chunks))]
 
+    existing = {"ids": [], "metadatas": []}
     try:
-        existing = col.get(where={"source": rel_path})
-        if existing["ids"]:
-            col.delete(ids=existing["ids"])
+        existing = col.get(where={"source": rel_path}, include=["metadatas"])
     except Exception:
         pass
+    if (len(existing["ids"]) == len(chunks) and set(existing["ids"]) == set(ids)
+            and all((m or {}).get("hash") == digest for m in existing["metadatas"])):
+        return len(chunks), False
 
-    ids       = [_doc_id(rel_path, i) for i in range(len(chunks))]
-    documents = chunks
-    metadatas = [{"source": rel_path, "chunk": i, "total_chunks": len(chunks)} for i in range(len(chunks))]
-
-    col.add(ids=ids, documents=documents, metadatas=metadatas)
-    return len(chunks)
+    metadatas = [{"source": rel_path, "chunk": i, "total_chunks": len(chunks), "hash": digest}
+                 for i in range(len(chunks))]
+    col.upsert(ids=ids, documents=chunks, metadatas=metadatas)
+    leftover = [i for i in existing["ids"] if i not in set(ids)]
+    for k in range(0, len(leftover), 500):
+        col.delete(ids=leftover[k:k + 500])
+    return len(chunks), True
 
 
 def _ensure_indexed() -> None:
@@ -155,6 +189,7 @@ def _ensure_indexed() -> None:
 
 
 def _run_reindex() -> dict:
+    t0 = time.time()
     md_files = []
     for dp in DOCS_PATHS:
         if dp.exists():
@@ -162,22 +197,35 @@ def _run_reindex() -> dict:
     total_chunks = 0
     indexed_files = []
     skipped = []
+    failed = []
+    changed_n = 0
 
     for f in md_files:
         base = next((dp for dp in DOCS_PATHS if str(f).startswith(str(dp))), DOCS_PATH)
-        n = _index_file(f, base)
+        rel = str(f.relative_to(base))
+        try:
+            n, changed = _index_file_ex(f, base)
+        except Exception as e:  # one bad file (embed timeout after retries) must not abort the run
+            print(f"index failed {rel}: {type(e).__name__}: {e}", file=sys.stderr)
+            failed.append(rel)
+            continue
         if n > 0:
-            indexed_files.append(str(f.relative_to(base)))
+            indexed_files.append(rel)
             total_chunks += n
+            changed_n += changed
         else:
-            skipped.append(str(f.relative_to(base)))
+            skipped.append(rel)
 
-    pruned, refused = _prune_stale(set(indexed_files) | set(skipped))
+    # failed files still exist on disk: they count as current so prune never drops their old chunks
+    pruned, refused = _prune_stale(set(indexed_files) | set(skipped) | set(failed))
     return {
         "files_indexed": len(indexed_files),
+        "files_changed": changed_n,
         "total_chunks": total_chunks,
         "skipped": skipped,
         "files": indexed_files,
+        "failed": failed,
+        "seconds": round(time.time() - t0, 1),
         "pruned_sources": pruned,
         "prune_refused": refused,
     }
@@ -283,11 +331,15 @@ def reindex_docs() -> str:
     result = _run_reindex()
     lines = [
         f"Indexed {result['files_indexed']} files ({result['total_chunks']} chunks)",
+        f"Changed {result['files_changed']} files re-embedded, {result['files_indexed'] - result['files_changed']} unchanged, "
+        f"{result['seconds']}s",
         f"Docs paths: {', '.join(str(p) for p in DOCS_PATHS)}",
         f"Pruned {len(result['pruned_sources'])} stale sources (file gone)",
     ]
     if result["prune_refused"]:
         lines.append(f"Prune refused: {result['prune_refused']}")
+    if result["failed"]:
+        lines.append(f"Failed {len(result['failed'])} files (embed error after retries): {', '.join(result['failed'][:20])}")
     if result["files"]:
         lines.append("\nFiles indexed:")
         lines.extend(f"  {f}" for f in result["files"])
